@@ -8,11 +8,106 @@ const { Pool } = pkg;
 
 dotenv.config();
 
-// --- Setup ---
-const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, {
-  chainId: 8453, // Base mainnet
-  name: "base"
-});
+// --- RPC Provider Setup with Fallback ---
+const primaryRpcUrl = process.env.RPC_URL;
+const fallbackRpcUrls = process.env.RPC_URL_FALLBACK
+  ? process.env.RPC_URL_FALLBACK.split(',').map(url => url.trim())
+  : [];
+
+const allRpcUrls = [primaryRpcUrl, ...fallbackRpcUrls];
+
+// Create multiple providers for fallback
+const providers = allRpcUrls.map(url =>
+  new ethers.JsonRpcProvider(url, {
+    chainId: 8453, // Base mainnet
+    name: "base"
+  })
+);
+
+const provider = providers[0]; // Primary provider for event listening
+
+console.log(`🌐 Configured ${providers.length} RPC provider(s):`);
+console.log(`   Primary: ${primaryRpcUrl}`);
+if (fallbackRpcUrls.length > 0) {
+  console.log(`   Fallback(s): ${fallbackRpcUrls.join(', ')}`);
+}
+
+// RPC failure tracking
+const rpcStats = {
+  primary: { calls: 0, failures: 0 },
+  fallback: fallbackRpcUrls.map(() => ({ calls: 0, failures: 0 }))
+};
+
+// Execute RPC call with automatic fallback
+async function executeWithFallback(operation, operationName = 'RPC call') {
+  const errors = [];
+
+  for (let i = 0; i < providers.length; i++) {
+    try {
+      const isMain = i === 0;
+      const stats = isMain ? rpcStats.primary : rpcStats.fallback[i - 1];
+      stats.calls++;
+
+      const result = await operation(providers[i]);
+
+      if (!isMain) {
+        console.log(`✅ ${operationName} succeeded with fallback RPC #${i}`);
+      }
+
+      return result;
+    } catch (err) {
+      const isMain = i === 0;
+      const stats = isMain ? rpcStats.primary : rpcStats.fallback[i - 1];
+      stats.failures++;
+
+      errors.push({ provider: i, error: err.message });
+
+      if (i === 0) {
+        console.error(`⚠️ Primary RPC failed for ${operationName}: ${err.message}`);
+      } else {
+        console.error(`⚠️ Fallback RPC #${i} failed for ${operationName}: ${err.message}`);
+      }
+
+      // If this is the last provider, throw error
+      if (i === providers.length - 1) {
+        console.error(`❌ All ${providers.length} RPC providers failed for ${operationName}`);
+        const error = new Error(`All RPC providers failed: ${errors.map(e => e.error).join('; ')}`);
+        error.allErrors = errors;
+        throw error;
+      }
+
+      // Small delay before trying next provider
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+}
+// Failed block retry queue
+const failedBlockQueue = new Set();
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_DELAY = 5000; // 5 seconds
+
+// Periodic failed block retry processor
+async function retryFailedBlocks() {
+  if (failedBlockQueue.size === 0) return;
+
+  console.log(`🔄 Retrying ${failedBlockQueue.size} failed block(s)...`);
+  const blocksToRetry = Array.from(failedBlockQueue);
+  failedBlockQueue.clear();
+
+  for (const blockNumber of blocksToRetry) {
+    try {
+      await processBlock(blockNumber, true); // true = is retry
+      console.log(`✅ Successfully retried block ${blockNumber}`);
+    } catch (err) {
+      console.error(`❌ Retry failed for block ${blockNumber}: ${err.message}`);
+      // Don't add back to queue - we tried our best
+    }
+  }
+}
+
+// Start retry processor (runs every 30 seconds)
+setInterval(retryFailedBlocks, 30000);
+
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 const FACTORY = process.env.FACTORY_ADDRESS.toLowerCase();
 
@@ -94,7 +189,12 @@ async function saveCartridge(data) {
     `
     INSERT INTO cartridges (address, title, game_link, genre, image, ipfs)
     VALUES ($1, $2, $3, $4, $5, $6)
-    ON CONFLICT (address) DO NOTHING;
+    ON CONFLICT (address) DO UPDATE SET
+      title = EXCLUDED.title,
+      genre = EXCLUDED.genre,
+      image = EXCLUDED.image,
+      ipfs = EXCLUDED.ipfs,
+      game_link = COALESCE(cartridges.game_link, EXCLUDED.game_link);
   `,
     [cartridge, title, gameLink || null, genre, img, ipfs]
   );
@@ -202,24 +302,29 @@ function decodeUtf8(hex) {
   }
 }
 
-// Get contract name and symbol
+// Get contract name and symbol with RPC fallback
 async function getContractInfo(contractAddress) {
   try {
     const contractABI = [
       "function name() view returns (string)",
       "function symbol() view returns (string)"
     ];
-    const contract = new ethers.Contract(contractAddress, contractABI, provider);
-    
-    const [name, symbol] = await Promise.all([
-      contract.name(),
-      contract.symbol()
-    ]);
-    
+
+    const result = await executeWithFallback(async (providerInstance) => {
+      const contract = new ethers.Contract(contractAddress, contractABI, providerInstance);
+
+      const [name, symbol] = await Promise.all([
+        contract.name(),
+        contract.symbol()
+      ]);
+
+      return { name, symbol };
+    }, `getContractInfo(${contractAddress.substring(0, 10)}...)`);
+
     // Extract just the game name (before " - Baes Game Cartridge")
-    const gameName = name.replace(/\s*-\s*Baes Game Cartridge\s*$/i, '').trim();
-    
-    return { name: gameName, symbol, fullName: name, success: true };
+    const gameName = result.name.replace(/\s*-\s*Baes Game Cartridge\s*$/i, '').trim();
+
+    return { name: gameName, symbol: result.symbol, fullName: result.name, success: true };
   } catch (err) {
     console.log(`⚠️ Could not read contract ${contractAddress.substring(0, 10)}... - will use fallback`);
     return { name: null, symbol: null, fullName: null, success: false };
@@ -551,7 +656,7 @@ bot.onText(/\/help/, (msg) => {
   const chatId = msg.chat.id;
   bot.sendMessage(
     chatId,
-    `🤖 *Bario Sales Bot Commands*\n\n*Subscription Management:*\n/subscribe - Start receiving notifications (admins only)\n/unsubscribe - Stop notifications (admins only)\n/subscribers - View all subscriptions\n\n*Information:*\n/list - View all tracked cartridges\n/stats - View tracking statistics\n/latest - Show most recent cartridge\n\n*Admin Tools:*\n/setlink - Add/update game link (whitelisted admins only)\n/updatelinks - Auto-update all game links (whitelisted admins only)\n/chatid - Get this chat's ID\n/myid - Get your user ID\n\n*Help:*\n/start - Welcome message\n/help - Show this message\n\n📡 Factory: \`${FACTORY}\``,
+    `🤖 *Bario Sales Bot Commands*\n\n*Subscription Management:*\n/subscribe - Start receiving notifications (admins only)\n/unsubscribe - Stop notifications (admins only)\n/subscribers - View all subscriptions\n\n*Information:*\n/list - View all tracked cartridges\n/stats - View tracking statistics\n/latest - Show most recent cartridge\n\n*Admin Tools:*\n/setlink - Add/update game link (whitelisted admins only)\n/updatelinks - Auto-update all game links (whitelisted admins only)\n/poolscan - Scan factory for missing transactions (whitelisted admins only)\n/rpcstats - View RPC provider statistics (whitelisted admins only)\n/chatid - Get this chat's ID\n/myid - Get your user ID\n\n*Help:*\n/start - Welcome message\n/help - Show this message\n\n📡 Factory: \`${FACTORY}\``,
     { parse_mode: "Markdown" }
   );
 });
@@ -872,10 +977,10 @@ bot.onText(/\/stats/, async (msg) => {
 
 bot.onText(/\/latest/, async (msg) => {
   const chatId = msg.chat.id;
-  
+
   try {
     const cartridges = await getAllCartridges();
-    
+
     if (cartridges.length === 0) {
       bot.sendMessage(chatId, "📭 No cartridges tracked yet!", { parse_mode: "Markdown" });
       return;
@@ -883,7 +988,7 @@ bot.onText(/\/latest/, async (msg) => {
 
     const latest = cartridges[0];
     const caption = `🎮 *${latest.title}* (Latest)\n\n🕹 Genre: ${latest.genre}\n💾 Contract: \`${latest.address}\`${latest.game_link ? `\n🔗 [Play on Bario](${latest.game_link})` : ''}\n\n${latest.ipfs ? `🪣 ${latest.ipfs}` : ""}`;
-    
+
     const imageUrl = latest.image || (latest.ipfs ? latest.ipfs.replace("ipfs://", "https://ipfs.io/ipfs/") : null);
 
     if (imageUrl) {
@@ -899,6 +1004,82 @@ bot.onText(/\/latest/, async (msg) => {
   }
 });
 
+// Admin command to manually trigger factory pool scan
+bot.onText(/\/poolscan/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  // Check admin whitelist
+  if (!isWhitelistedAdmin(userId)) {
+    return bot.sendMessage(
+      chatId,
+      "⛔ You are not authorized to use this command. Contact the bot administrator.",
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  bot.sendMessage(chatId, "🔍 Starting factory transaction pool scan... This may take a few minutes.", { parse_mode: "Markdown" });
+
+  try {
+    const result = await poolFactoryTransactions();
+
+    if (result.success) {
+      let message = `✅ *Pool Scan Complete!*\n\n`;
+      message += `📊 Total transactions scanned: ${result.total}\n`;
+      message += `✨ New cartridges found: ${result.processed}\n`;
+      bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
+    } else {
+      bot.sendMessage(chatId, `❌ Pool scan failed: ${result.error}`, { parse_mode: "Markdown" });
+    }
+  } catch (e) {
+    bot.sendMessage(chatId, "❌ Pool scan error: " + e.message);
+  }
+});
+
+// Admin command to view RPC stats
+bot.onText(/\/rpcstats/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  // Check admin whitelist
+  if (!isWhitelistedAdmin(userId)) {
+    return bot.sendMessage(
+      chatId,
+      "⛔ You are not authorized to use this command. Contact the bot administrator.",
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  let message = `📊 *RPC Provider Statistics*\n\n`;
+
+  // Primary RPC stats
+  const primarySuccessRate = rpcStats.primary.calls > 0
+    ? ((rpcStats.primary.calls - rpcStats.primary.failures) / rpcStats.primary.calls * 100).toFixed(2)
+    : 0;
+  message += `🌐 *Primary RPC:*\n`;
+  message += `   Calls: ${rpcStats.primary.calls}\n`;
+  message += `   Failures: ${rpcStats.primary.failures}\n`;
+  message += `   Success Rate: ${primarySuccessRate}%\n\n`;
+
+  // Fallback RPC stats
+  if (rpcStats.fallback.length > 0) {
+    rpcStats.fallback.forEach((stats, index) => {
+      const successRate = stats.calls > 0
+        ? ((stats.calls - stats.failures) / stats.calls * 100).toFixed(2)
+        : 0;
+      message += `🔄 *Fallback RPC #${index + 1}:*\n`;
+      message += `   Calls: ${stats.calls}\n`;
+      message += `   Failures: ${stats.failures}\n`;
+      message += `   Success Rate: ${successRate}%\n\n`;
+    });
+  }
+
+  // Failed block queue
+  message += `📝 *Failed Block Queue:* ${failedBlockQueue.size} block(s) pending retry`;
+
+  bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
+});
+
 bot.on("polling_error", (error) => {
   console.log("⚠️ Polling error:", error.message);
 });
@@ -906,8 +1087,12 @@ bot.on("polling_error", (error) => {
 // --- Factory TX Handler ---
 async function handleFactoryTx(tx) {
   if (!tx.data.startsWith("0x02a91f5e")) return;
-  
-  const receipt = await provider.waitForTransaction(tx.hash, 1);
+
+  const receipt = await executeWithFallback(
+    async (providerInstance) => providerInstance.waitForTransaction(tx.hash, 1),
+    `waitForTransaction(${tx.hash.substring(0, 10)}...)`
+  );
+
   if (!receipt) return;
 
   let newContract = receipt.contractAddress || null;
@@ -979,173 +1164,323 @@ if (CHAT_DESTINATIONS.length > 0) {
 // Start automatic link updater (runs on startup + every 24 hours)
 await startAutoUpdater();
 
+// Factory transaction pooling - Simple approach to scan historical transactions
+async function poolFactoryTransactions(fromBlock = 'earliest', toBlock = 'latest') {
+  console.log(`🔍 Pooling factory transactions from block ${fromBlock} to ${toBlock}...`);
+
+  try {
+    // Use Basescan API to get transactions for the factory address
+    const basescanApiKey = process.env.BASESCAN_API_KEY || '';
+    const factoryAddress = FACTORY;
+
+    // If we have Basescan API key, use it for historical data
+    if (basescanApiKey) {
+      try {
+        const url = `https://api.basescan.org/api?module=account&action=txlist&address=${factoryAddress}&startblock=0&endblock=99999999&sort=asc&apikey=${basescanApiKey}`;
+        const response = await axios.get(url, { timeout: 30000 });
+
+        if (response.data.status === '1' && Array.isArray(response.data.result)) {
+          console.log(`📦 Found ${response.data.result.length} historical transactions for factory`);
+
+          let processedCount = 0;
+          for (const tx of response.data.result) {
+            // Only process createCartridge transactions
+            if (tx.input && tx.input.startsWith('0x02a91f5e') && tx.isError === '0') {
+              const txHash = tx.hash;
+
+              // Check if we already have this cartridge
+              const receipt = await executeWithFallback(
+                async (providerInstance) => providerInstance.getTransactionReceipt(txHash),
+                `getTransactionReceipt(${txHash.substring(0, 10)}...) - historical`
+              );
+
+              if (receipt && receipt.contractAddress) {
+                const contractAddr = receipt.contractAddress.toLowerCase();
+
+                // Check if already in database
+                const existing = await pool.query(
+                  "SELECT address FROM cartridges WHERE LOWER(address) = LOWER($1)",
+                  [contractAddr]
+                );
+
+                if (existing.rows.length === 0) {
+                  // New cartridge found! Get full transaction and process it
+                  const fullTx = await executeWithFallback(
+                    async (providerInstance) => providerInstance.getTransaction(txHash),
+                    `getTransaction(${txHash.substring(0, 10)}...) - historical`
+                  );
+
+                  if (fullTx) {
+                    console.log(`✨ Found missing cartridge: ${contractAddr} (tx: ${txHash.substring(0, 10)}...)`);
+                    await handleFactoryTx(fullTx);
+                    processedCount++;
+                  }
+                }
+              }
+            }
+          }
+
+          console.log(`✅ Historical scan complete: ${processedCount} new cartridge(s) added`);
+          return { success: true, processed: processedCount, total: response.data.result.length };
+        }
+      } catch (apiErr) {
+        console.log(`⚠️ Basescan API failed: ${apiErr.message}, falling back to RPC scan`);
+      }
+    }
+
+    // Fallback: Use RPC to scan logs (limited range)
+    console.log(`🔄 Using RPC fallback to scan factory logs...`);
+
+    // Get current block
+    const currentBlock = await executeWithFallback(
+      async (providerInstance) => providerInstance.getBlockNumber(),
+      'getBlockNumber'
+    );
+
+    // Scan last 500000 blocks (about 11-12 days on Base with 2s block time)
+    const scanFromBlock = Math.max(0, currentBlock - 500000);
+
+    const logs = await executeWithFallback(
+      async (providerInstance) => providerInstance.getLogs({
+        fromBlock: scanFromBlock,
+        toBlock: 'latest',
+        address: factoryAddress,
+      }),
+      `getLogs(factory, blocks ${scanFromBlock}-latest)`
+    );
+
+    console.log(`📦 Found ${logs.length} factory logs in recent blocks`);
+
+    let processedCount = 0;
+    let skippedCount = 0;
+    const processedTxs = new Set();
+
+    for (const log of logs) {
+      // Skip if we already processed this transaction
+      if (processedTxs.has(log.transactionHash)) continue;
+      processedTxs.add(log.transactionHash);
+
+      const tx = await executeWithFallback(
+        async (providerInstance) => providerInstance.getTransaction(log.transactionHash),
+        `getTransaction(${log.transactionHash.substring(0, 10)}...)`
+      );
+
+      // Check if this is a createCartridge transaction
+      if (tx && tx.data && tx.data.startsWith("0x02a91f5e")) {
+        console.log(`   🔍 Processing createCartridge tx: ${tx.hash.substring(0, 10)}...`);
+
+        // Process it - handleFactoryTx will extract the contract address from receipt logs
+        await handleFactoryTx(tx);
+        processedCount++;
+      } else {
+        console.log(`   ⏭️ Skipping non-createCartridge tx: ${log.transactionHash.substring(0, 10)}...`);
+        skippedCount++;
+      }
+    }
+
+    console.log(`📊 RPC scan summary:`);
+    console.log(`   - Total logs found: ${logs.length}`);
+    console.log(`   - CreateCartridge txs found: ${processedTxs.size}`);
+    console.log(`   - Skipped (not createCartridge): ${skippedCount}`);
+    console.log(`   - Cartridges processed: ${processedCount}`);
+
+    console.log(`✅ RPC scan complete: ${processedCount} new cartridge(s) added from recent blocks`);
+    return { success: true, processed: processedCount, total: logs.length };
+  } catch (err) {
+    console.error(`❌ Factory transaction pooling failed: ${err.message}`);
+    return { success: false, error: err.message };
+  }
+}
+
+// Run factory transaction pooling on startup (async, don't block)
+console.log('🚀 Starting factory transaction pool scan...');
+poolFactoryTransactions().then(result => {
+  if (result.success) {
+    console.log(`✅ Factory pool scan finished: ${result.processed} new game(s) found`);
+  } else {
+    console.error(`❌ Factory pool scan failed: ${result.error}`);
+  }
+}).catch(err => {
+  console.error(`❌ Factory pool scan error: ${err.message}`);
+});
+
+// Process a single block (extracted for retry capability)
+async function processBlock(blockNumber, isRetry = false) {
+  const trackedAddresses = Array.from(cartridges);
+  trackedAddresses.push(FACTORY); // Also watch factory
+
+  // Use fallback RPC if getLogs fails
+  const logs = await executeWithFallback(
+    async (providerInstance) => providerInstance.getLogs({
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+      address: trackedAddresses,
+    }),
+    `getLogs(block ${blockNumber}${isRetry ? ' - retry' : ''})`
+  );
+
+  if (logs.length > 0) {
+    console.log(`📦 Block ${blockNumber}: Found ${logs.length} logs from tracked addresses`);
+
+    // Process each log - look for Transfer events (NFT mints)
+    // Transfer event signature: Transfer(address,address,uint256)
+    const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+    // Group mints by transaction hash to send a single notification per transaction
+    const mintsByTransaction = new Map();
+
+    for (const log of logs) {
+      const contractAddr = log.address.toLowerCase();
+
+      // Check if this is a Transfer event from a cartridge (mint)
+      if (cartridges.has(contractAddr) && log.topics[0] === TRANSFER_TOPIC) {
+        // Check if it's a mint (from address is 0x0)
+        const fromAddr = log.topics[1]; // indexed 'from' parameter
+        const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+        if (fromAddr === ZERO_ADDRESS) {
+          // Group by transaction hash
+          if (!mintsByTransaction.has(log.transactionHash)) {
+            mintsByTransaction.set(log.transactionHash, []);
+          }
+          mintsByTransaction.get(log.transactionHash).push({
+            contractAddr,
+            txHash: log.transactionHash
+          });
+        }
+      }
+
+      // Check for new cartridge deployments
+      if (contractAddr === FACTORY) {
+        const tx = await executeWithFallback(
+          async (providerInstance) => providerInstance.getTransaction(log.transactionHash),
+          `getTransaction(${log.transactionHash.substring(0, 10)}...)`
+        );
+        if (tx && tx.data && tx.data.startsWith("0x02a91f5e")) {
+          console.log(`🎮 New cartridge deployment detected!`);
+          handleFactoryTx(tx);
+        }
+      }
+    }
+
+    // Send consolidated notifications for mints
+    for (const [txHash, mints] of mintsByTransaction) {
+      const uniqueContracts = [...new Set(mints.map(m => m.contractAddr))];
+
+      if (uniqueContracts.length === 1) {
+        // Single cartridge, count how many were minted
+        const mintCount = mints.length;
+        console.log(`💸 ${mintCount} MINT(S) DETECTED in single transaction for ${uniqueContracts[0]}!`);
+
+        try {
+          const cartridgeInfo = await pool.query(
+            "SELECT title, image, ipfs, game_link FROM cartridges WHERE LOWER(address) = LOWER($1)",
+            [uniqueContracts[0]]
+          );
+
+          if (cartridgeInfo.rows.length === 0) {
+            console.log(`⚠️ Cartridge ${uniqueContracts[0]} not found in database!`);
+            continue;
+          }
+
+          const gameName = cartridgeInfo.rows[0]?.title || "Unknown Game";
+          const img = cartridgeInfo.rows[0]?.image;
+          const ipfs = cartridgeInfo.rows[0]?.ipfs;
+          const gameLink = cartridgeInfo.rows[0]?.game_link;
+
+          const imageUrl = img || (ipfs ? ipfs.replace("ipfs://", "https://ipfs.io/ipfs/") : null);
+
+          // 🚀 HYPE SALES MESSAGE! 🚀
+          let caption = `🚀 *${mintCount > 1 ? mintCount + ' CARTRIDGES' : 'NEW CARTRIDGE'} SOLD!* 🚀\n\n`;
+          caption += `🎮 *${gameName}*\n`;
+          if (gameLink) {
+            caption += `🔗 [Play Now on BAES](${gameLink})\n`;
+          }
+          caption += `📜 [View Transaction](https://basescan.org/tx/${txHash})\n\n`;
+          caption += `🔥 ${mintCount > 1 ? mintCount + ' collectors' : 'Another collector'} joined the game!`;
+
+          await sendToAllChats(null, {
+            isPhoto: !!imageUrl,
+            imageUrl: imageUrl,
+            caption: caption,
+            text: caption
+          });
+
+          console.log(`✅ Sale notification sent for ${gameName} (${mintCount} mint${mintCount > 1 ? 's' : ''})`);
+        } catch (dbErr) {
+          console.error(`❌ Database error:`, dbErr.message);
+        }
+      } else {
+        // Multiple different cartridges in one transaction (rare case)
+        console.log(`💸 ${mints.length} MINTS DETECTED across ${uniqueContracts.length} cartridges in transaction ${txHash}!`);
+
+        try {
+          const gameNames = [];
+          let firstImage = null;
+
+          for (const contractAddr of uniqueContracts) {
+            const cartridgeInfo = await pool.query(
+              "SELECT title, image, ipfs FROM cartridges WHERE LOWER(address) = LOWER($1)",
+              [contractAddr]
+            );
+
+            if (cartridgeInfo.rows.length > 0) {
+              const gameName = cartridgeInfo.rows[0]?.title || "Unknown Game";
+              const mintCountForGame = mints.filter(m => m.contractAddr === contractAddr).length;
+              gameNames.push(`${gameName}${mintCountForGame > 1 ? ` (×${mintCountForGame})` : ''}`);
+
+              if (!firstImage) {
+                const img = cartridgeInfo.rows[0]?.image;
+                const ipfs = cartridgeInfo.rows[0]?.ipfs;
+                firstImage = img || (ipfs ? ipfs.replace("ipfs://", "https://ipfs.io/ipfs/") : null);
+              }
+            }
+          }
+
+          let caption = `🚀 *${mints.length} CARTRIDGES SOLD!* 🚀\n\n`;
+          caption += `🎮 ${gameNames.join(', ')}\n`;
+          caption += `📜 [View Transaction](https://basescan.org/tx/${txHash})\n\n`;
+          caption += `🔥 Multiple collectors joined the game!`;
+
+          await sendToAllChats(null, {
+            isPhoto: !!firstImage,
+            imageUrl: firstImage,
+            caption: caption,
+            text: caption
+          });
+
+          console.log(`✅ Multi-cartridge sale notification sent (${mints.length} mints)`);
+        } catch (dbErr) {
+          console.error(`❌ Database error:`, dbErr.message);
+        }
+      }
+    }
+  }
+}
+
 // Monitor confirmed blocks efficiently using eth_getLogs
 let blockCount = 0;
 let lastProcessedBlock = 0;
 provider.on("block", async (blockNumber) => {
   try {
     blockCount++;
-    
+
     // Skip if we already processed this block
     if (blockNumber <= lastProcessedBlock) return;
     lastProcessedBlock = blockNumber;
-    
+
     // Log progress every 10 blocks
     if (blockCount % 10 === 0) {
       console.log(`✅ Monitoring active - block ${blockNumber} (${blockCount} processed)`);
     }
-    
-    // Use eth_getLogs to efficiently find transactions to our tracked addresses
-    // This is MUCH faster than fetching all 300+ transactions individually
-    const trackedAddresses = Array.from(cartridges);
-    trackedAddresses.push(FACTORY); // Also watch factory
-    
-    try {
-      const logs = await provider.getLogs({
-        fromBlock: blockNumber,
-        toBlock: blockNumber,
-        address: trackedAddresses, // Only get logs from our tracked addresses
-      });
-      
-      if (logs.length > 0) {
-        console.log(`📦 Block ${blockNumber}: Found ${logs.length} logs from tracked addresses`);
-        
-        // Process each log - look for Transfer events (NFT mints)
-        // Transfer event signature: Transfer(address,address,uint256)
-        const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-        
-        // Group mints by transaction hash to send a single notification per transaction
-        const mintsByTransaction = new Map();
-        
-        for (const log of logs) {
-          const contractAddr = log.address.toLowerCase();
-          
-          // Check if this is a Transfer event from a cartridge (mint)
-          if (cartridges.has(contractAddr) && log.topics[0] === TRANSFER_TOPIC) {
-            // Check if it's a mint (from address is 0x0)
-            const fromAddr = log.topics[1]; // indexed 'from' parameter
-            const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000000000000000000000000000";
-            
-            if (fromAddr === ZERO_ADDRESS) {
-              // Group by transaction hash
-              if (!mintsByTransaction.has(log.transactionHash)) {
-                mintsByTransaction.set(log.transactionHash, []);
-              }
-              mintsByTransaction.get(log.transactionHash).push({
-                contractAddr,
-                txHash: log.transactionHash
-              });
-            }
-          }
-          
-          // Check for new cartridge deployments
-          if (contractAddr === FACTORY) {
-            const tx = await provider.getTransaction(log.transactionHash);
-            if (tx && tx.data && tx.data.startsWith("0x02a91f5e")) {
-              console.log(`🎮 New cartridge deployment detected!`);
-              handleFactoryTx(tx);
-            }
-          }
-        }
-        
-        // Send consolidated notifications for mints
-        for (const [txHash, mints] of mintsByTransaction) {
-          const uniqueContracts = [...new Set(mints.map(m => m.contractAddr))];
-          
-          if (uniqueContracts.length === 1) {
-            // Single cartridge, count how many were minted
-            const mintCount = mints.length;
-            console.log(`💸 ${mintCount} MINT(S) DETECTED in single transaction for ${uniqueContracts[0]}!`);
-            
-            try {
-              const cartridgeInfo = await pool.query(
-                "SELECT title, image, ipfs, game_link FROM cartridges WHERE LOWER(address) = LOWER($1)",
-                [uniqueContracts[0]]
-              );
-              
-              if (cartridgeInfo.rows.length === 0) {
-                console.log(`⚠️ Cartridge ${uniqueContracts[0]} not found in database!`);
-                continue;
-              }
-              
-              const gameName = cartridgeInfo.rows[0]?.title || "Unknown Game";
-              const img = cartridgeInfo.rows[0]?.image;
-              const ipfs = cartridgeInfo.rows[0]?.ipfs;
-              const gameLink = cartridgeInfo.rows[0]?.game_link;
-              
-              const imageUrl = img || (ipfs ? ipfs.replace("ipfs://", "https://ipfs.io/ipfs/") : null);
-              
-              // 🚀 HYPE SALES MESSAGE! 🚀
-              let caption = `🚀 *${mintCount > 1 ? mintCount + ' CARTRIDGES' : 'NEW CARTRIDGE'} SOLD!* 🚀\n\n`;
-              caption += `🎮 *${gameName}*\n`;
-              if (gameLink) {
-                caption += `🔗 [Play Now on BAES](${gameLink})\n`;
-              }
-              caption += `📜 [View Transaction](https://basescan.org/tx/${txHash})\n\n`;
-              caption += `🔥 ${mintCount > 1 ? mintCount + ' collectors' : 'Another collector'} joined the game!`;
-              
-              await sendToAllChats(null, {
-                isPhoto: !!imageUrl,
-                imageUrl: imageUrl,
-                caption: caption,
-                text: caption
-              });
-              
-              console.log(`✅ Sale notification sent for ${gameName} (${mintCount} mint${mintCount > 1 ? 's' : ''})`);
-            } catch (dbErr) {
-              console.error(`❌ Database error:`, dbErr.message);
-            }
-          } else {
-            // Multiple different cartridges in one transaction (rare case)
-            console.log(`💸 ${mints.length} MINTS DETECTED across ${uniqueContracts.length} cartridges in transaction ${txHash}!`);
-            
-            try {
-              const gameNames = [];
-              let firstImage = null;
-              
-              for (const contractAddr of uniqueContracts) {
-                const cartridgeInfo = await pool.query(
-                  "SELECT title, image, ipfs FROM cartridges WHERE LOWER(address) = LOWER($1)",
-                  [contractAddr]
-                );
-                
-                if (cartridgeInfo.rows.length > 0) {
-                  const gameName = cartridgeInfo.rows[0]?.title || "Unknown Game";
-                  const mintCountForGame = mints.filter(m => m.contractAddr === contractAddr).length;
-                  gameNames.push(`${gameName}${mintCountForGame > 1 ? ` (×${mintCountForGame})` : ''}`);
-                  
-                  if (!firstImage) {
-                    const img = cartridgeInfo.rows[0]?.image;
-                    const ipfs = cartridgeInfo.rows[0]?.ipfs;
-                    firstImage = img || (ipfs ? ipfs.replace("ipfs://", "https://ipfs.io/ipfs/") : null);
-                  }
-                }
-              }
-              
-              let caption = `🚀 *${mints.length} CARTRIDGES SOLD!* 🚀\n\n`;
-              caption += `🎮 ${gameNames.join(', ')}\n`;
-              caption += `📜 [View Transaction](https://basescan.org/tx/${txHash})\n\n`;
-              caption += `🔥 Multiple collectors joined the game!`;
-              
-              await sendToAllChats(null, {
-                isPhoto: !!firstImage,
-                imageUrl: firstImage,
-                caption: caption,
-                text: caption
-              });
-              
-              console.log(`✅ Multi-cartridge sale notification sent (${mints.length} mints)`);
-            } catch (dbErr) {
-              console.error(`❌ Database error:`, dbErr.message);
-            }
-          }
-        }
-      }
-    } catch (logsErr) {
-      console.error(`⚠️ Error getting logs for block ${blockNumber}:`, logsErr.message);
-    }
+
+    // Process block with fallback RPC support
+    await processBlock(blockNumber, false);
   } catch (err) {
     console.error(`⚠️ Error processing block ${blockNumber}:`, err.message);
+    // Add to retry queue if processing failed
+    console.log(`📝 Adding block ${blockNumber} to retry queue`);
+    failedBlockQueue.add(blockNumber);
   }
 });
 
